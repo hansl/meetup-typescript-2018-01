@@ -17,6 +17,7 @@
   "author": "Hans Larsen",
   "license": "Apache-2.0",
   "dependencies": {
+    "rxjs": "^5.5.6",
     "typescript": "~2.7.0-"
   }
 }
