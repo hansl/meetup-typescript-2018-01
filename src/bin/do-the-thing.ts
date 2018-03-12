@@ -11,93 +11,133 @@ const parsedTsConfig = ts.parseJsonConfigFileContent(tsConfig.config, ts.sys, '.
 const program = ts.createProgram(parsedTsConfig.fileNames, parsedTsConfig.options);
 const tc = program.getTypeChecker();
 
-// Parse the arguments.
-const argv = process.argv.slice(1);
-if (argv[1] === undefined) {
-  console.log('Usage: do-the-thing fileName');
-  process.exit(1);
-}
-const filePath = path.resolve(process.cwd(), argv[1]);
 
-// Get the sourceFile file of this path.
-const sourceFile = program.getSourceFile(filePath);
-if (!sourceFile) {
-  console.error('Source not included in the tsconfig?');
-  process.exit(10);
+function _findAllNgComponentClass(sourceFile: ts.SourceFile, metadata: ts.ObjectLiteralExpression) {
+  const allNgComponentDeclarations = [] as [string, string][];
+
+  findNodes<ts.PropertyAssignment>(metadata, sourceFile, ts.SyntaxKind.PropertyAssignment)
+    .forEach(node => {
+      let name = '';
+      // Get the node's name.
+      switch (node.name.kind) {
+        case ts.SyntaxKind.StringLiteral:
+          name = (node.name as ts.StringLiteral).text;
+          break;
+        case ts.SyntaxKind.Identifier:
+          name = (node.name as ts.Identifier).text;
+          break;
+      }
+
+      if (!name) {
+        return;
+      }
+
+      if (name == 'declarations' && node.initializer.kind == ts.SyntaxKind.ArrayLiteralExpression) {
+        findNodes<ts.Identifier>(node.initializer, sourceFile, ts.SyntaxKind.Identifier)
+          .forEach(ident => {
+            // Find the source of this identifier.
+            let symbol: ts.Symbol = tc.getSymbolAtLocation(ident) !;
+            // Resolve the symbol back to its declaration.
+            while (symbol.flags & ts.SymbolFlags.Alias) {
+              symbol = tc.getAliasedSymbol(symbol);
+            }
+
+            // Find all declarations (there can be multiple).
+            const declarations = symbol.getDeclarations();
+            if (!declarations || declarations.length == 0) {
+              allNgComponentDeclarations.push([ident.text, 'Unknown']);
+            } else {
+              allNgComponentDeclarations.push([ident.text, declarations[0].getSourceFile().fileName]);
+            }
+          });
+      }
+    });
+
+  return allNgComponentDeclarations;
 }
 
-// Get all the classes
-const allClasses = findNodes<ts.ClassDeclaration>(sourceFile, sourceFile, ts.SyntaxKind.ClassDeclaration);
-if (allClasses.length == 0) {
-  console.error('Woah. No classes.');
-  process.exit(2);
-}
 
-// If the user passed in a class name, use that class. Otherwise use the first one.
-let classNode = allClasses[0];
-if (argv[2]) {
-  const maybeNode = allClasses.find(x => !!x.name && x.name.text == argv[2]);
-  if (maybeNode === undefined) {
-    console.log(`Couldn't find class named ${argv[2]}.`);
-    process.exit(3);
+function _checkClassForNgModule(sourceFile: ts.SourceFile, classNode: ts.ClassDeclaration) {
+  let found = false;
+  let ngModuleMetadata: ts.ObjectLiteralExpression | undefined = undefined;
+
+  // Resolve `@angular/core`'s NgModule for the current file.
+  const angularCoreModule = ts.resolveModuleName(
+    '@angular/core',
+    sourceFile.fileName,
+    parsedTsConfig.options,
+    ts.sys,
+  ).resolvedModule;
+
+  if (!angularCoreModule) {
+    return;
   }
-  classNode = maybeNode !;
+  const angularCoreRoot = path.dirname(angularCoreModule.resolvedFileName);
+
+  // Get all decorators of all classes that come from Angular.
+  findNodes<ts.Decorator>(classNode, sourceFile, ts.SyntaxKind.Decorator)
+    .forEach(decoratorNode => {
+      const fnCall = findNodes<ts.CallExpression>(decoratorNode, sourceFile, ts.SyntaxKind.CallExpression, 1)[0];
+
+      let symbol: ts.Symbol = tc.getSymbolAtLocation(fnCall.expression) !;
+      // Resolve the symbol back to its declaration.
+      while (symbol.flags & ts.SymbolFlags.Alias) {
+        symbol = tc.getAliasedSymbol(symbol);
+      }
+
+      // Assert this is NgModule.
+      if (symbol.escapedName != 'NgModule') {
+        return;
+      }
+
+      // Find all declarations (there can be multiple).
+      const declarations = symbol.getDeclarations() || [];
+
+      if (declarations.some(x => x.getSourceFile().fileName.startsWith(angularCoreRoot))) {
+        if (found) {
+          throw new Error('Multiple declarations found on a single class...');
+        }
+        found = true;
+
+        // The metadata is the object literal found as parameter.
+        ngModuleMetadata = fnCall.arguments[0] as ts.ObjectLiteralExpression;
+        if (!ngModuleMetadata) {
+          return;
+        }
+        if (ngModuleMetadata.kind != ts.SyntaxKind.ObjectLiteralExpression) {
+          return;
+        }
+      }
+    });
+
+  if (!found || !ngModuleMetadata) {
+    return;
+  }
+
+
+  console.log('Filename: ' + path.relative(process.cwd(), sourceFile.fileName));
+  console.log(`  Class ${classNode.name ? JSON.stringify(classNode.name.text) : '<anonymous>'}`);
+  console.log(`  Declares components:`);
+  _findAllNgComponentClass(sourceFile, ngModuleMetadata)
+    .forEach(([symbolName, filePath]) => {
+      console.log(`    ${symbolName} (${JSON.stringify(path.relative(process.cwd(), filePath)})`)
+    })
 }
 
+function _checkFileForNgModule(sourceFile: ts.SourceFile) {
+  // Get all the classes
+  const allClasses = findNodes<ts.ClassDeclaration>(sourceFile, sourceFile, ts.SyntaxKind.ClassDeclaration);
+  if (allClasses.length == 0) {
+    return [];
+  }
 
-let found = false;
-let ngModuleMetadata: ts.ObjectLiteralExpression;
-const angularCoreModule = ts.resolveModuleName('@angular/core', sourceFile.fileName, parsedTsConfig.options, ts.sys).resolvedModule;
-if (!angularCoreModule) {
-  console.log('Could not resolve @angular/core');
-  process.exit(5);
-}
-const angularCoreRoot = path.dirname(angularCoreModule.resolvedFileName);
-
-// Get all decorators of all classes that come from Angular.
-findNodes<ts.Decorator>(classNode, sourceFile, ts.SyntaxKind.Decorator)
-  .forEach(decoratorNode => {
-    const fnCall = findNodes<ts.CallExpression>(decoratorNode, sourceFile, ts.SyntaxKind.CallExpression, 1)[0];
-
-    let symbol: ts.Symbol = tc.getSymbolAtLocation(fnCall.expression) !;
-    // Resolve the symbol back to its declaration.
-    while (symbol.flags & ts.SymbolFlags.Alias) {
-      symbol = tc.getAliasedSymbol(symbol);
-    }
-
-    // Assert this is NgModule.
-    if (symbol.escapedName != 'NgModule') {
-      return;
-    }
-
-    // Find all declarations (there can be multiple).
-    const declarations = symbol.getDeclarations() || [];
-
-    if (declarations.some(x => x.getSourceFile().fileName.startsWith(angularCoreRoot))) {
-      if (found) {
-        console.log('Multiple declarations found...');
-        process.exit(6);
-      }
-      found = true;
-
-      // The metadata is the object literal found as parameter.
-      ngModuleMetadata = fnCall.arguments[0] as ts.ObjectLiteralExpression;
-      if (!ngModuleMetadata) {
-        console.log('NgModule found but no argument.');
-        process.exit(7);
-      }
-      if (ngModuleMetadata.kind != ts.SyntaxKind.ObjectLiteralExpression) {
-        console.log('Argument found but it is not an object literal.');
-        process.exit(8);
-      }
-    }
+  allClasses.forEach(klass => {
+    _checkClassForNgModule(sourceFile, klass);
   });
-
-if (!found) {
-  console.log('Could not find metadata... :sad-panda:');
-  process.exit(9);
 }
 
 
-console.log('Found!');
-console.log(ngModuleMetadata.getFullText());
+program.getSourceFiles()
+  .forEach(sourceFile => {
+    _checkFileForNgModule(sourceFile);
+  });
